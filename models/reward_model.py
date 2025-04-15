@@ -1,582 +1,156 @@
 # models/reward_model.py
-import os
 import torch
-import numpy as np
-import json
-import wandb
-from tqdm import tqdm
-from torch.optim import AdamW
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, RobertaTokenizer
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-from scipy import stats
-
-from models.reward_model import RewardModel
+import torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-class RewardModelTrainer:
-    """Trainer class for the reward model."""
+class RewardModel(nn.Module):
+    """Reward model that predicts whether text is toxic or not."""
     
-    def __init__(self, config, model=None, tokenizer=None):
+    def __init__(self, model_name, use_half_precision=False, device="cuda", num_unfrozen_layers=1):
         """
-        Initialize the trainer.
+        Initialize the reward model with a value head on top of a language model.
         
         Args:
-            config: Configuration object
-            model: Optional pre-initialized model
-            tokenizer: Optional pre-initialized tokenizer
+            model_name: Name or path of the base language model
+            use_half_precision: Whether to use half precision (float16)
+            device: Device to use (cuda or cpu)
+            num_unfrozen_layers: Number of layers to unfreeze for training (from the end)
         """
-        self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        super().__init__()
         
-        # Initialize the model if not provided
-        if model is None or tokenizer is None:
-            self._init_model_and_tokenizer()
-        else:
-            self.reward_model = model
-            self.tokenizer = tokenizer
+        # Set up device and precision
+        self.device = device
+        self.device_type = 'cuda' if 'cuda' in str(device) else 'cpu'  # Get device type as string
+        self.use_half_precision = use_half_precision
         
-        # Initialize true reward model for evaluation
-        self._init_true_reward_model()
-        
-        # Set random seed
-        torch.manual_seed(config.training.seed)
-        np.random.seed(config.training.seed)
-        
-        # Create unique model identifier
-        import time
-        from datetime import datetime
-        self.timestamp = int(time.time())
-        self.formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.model_identifier = f"{config.model.model_pair}_{self.formatted_time}"
-        
-        # Set up model paths
-        self.model_save_dir = os.path.join(config.logging.model_dir, self.model_identifier)
-        os.makedirs(self.model_save_dir, exist_ok=True)
-        
-        # Initialize metrics history
-        self.metrics_history = []
-    
-    def _init_model_and_tokenizer(self):
-        """Initialize the reward model and tokenizer."""
-        original_model_path, _ = self.config.model.get_model_paths()
-        
-        print(f"Initializing reward model based on {original_model_path}...")
-        self.reward_model = RewardModel(
-            model_name=original_model_path,
-            use_half_precision=self.config.model.use_half_precision,
-            device=self.device,
-            num_unfrozen_layers=1  # Unfreeze only the last layer
-        )
-        
-        self.tokenizer = AutoTokenizer.from_pretrained(original_model_path)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.padding_side = 'left'
-    
-    def _init_true_reward_model(self):
-        """Initialize the true reward model for evaluation."""
-        print("Loading true reward model...")
-        true_reward_model_name = "facebook/roberta-hate-speech-dynabench-r4-target"
-        self.true_reward_tokenizer = RobertaTokenizer.from_pretrained(true_reward_model_name)
-        self.true_reward_model = AutoModelForSequenceClassification.from_pretrained(
-            true_reward_model_name,
-            torch_dtype=torch.float16
+        # Load the base LM with the appropriate precision
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16 if use_half_precision else None,
         ).to(self.device)
+        
+        # Add a value head with careful initialization
+        self.v_head = nn.Linear(self.model.config.hidden_size, 1, bias=False).to(self.device)
+        # Initialize with small values to avoid NaN issues
+        self.v_head.weight.data.normal_(mean=0.0, std=0.01)
+            
+        # Freeze the base model if it's large
+        self._freeze_base_model(num_unfrozen_layers)
     
-    def prepare_data(self, original_data, detoxified_data):
+    def _freeze_base_model(self, num_unfrozen_layers):
         """
-        Prepare data for training.
+        Freeze the base model, except for the last few layers.
         
         Args:
-            original_data: List of original (potentially toxic) samples
-            detoxified_data: List of detoxified samples
-            
-        Returns:
-            Train and test data splits
+            num_unfrozen_layers: Number of layers to unfreeze (from the end)
         """
-        # Verify data
-        assert len(original_data) == len(detoxified_data), "Original and detoxified data must have the same length"
-        
-        # Split data into train/test sets
-        train_size = int(self.config.training.train_test_split * len(original_data))
-        
-        train_data = {
-            'original': original_data[:train_size],
-            'detoxified': detoxified_data[:train_size]
-        }
-        
-        test_data = {
-            'original': original_data[train_size:],
-            'detoxified': detoxified_data[train_size:]
-        }
-        
-        print(f"Training set: {len(train_data['original'])} samples")
-        print(f"Test set: {len(test_data['original'])} samples")
-        
-        return train_data, test_data
-    
-    def data_loader(self, original_data, detoxified_data, batch_size):
-        """
-        Create batches of paired data.
-        
-        Args:
-            original_data: Original (toxic) samples
-            detoxified_data: Detoxified samples
-            batch_size: Batch size
+        # First freeze all parameters
+        for param in self.model.parameters():
+            param.requires_grad = False
             
-        Yields:
-            Batches of paired data
-        """
-        assert len(original_data) == len(detoxified_data), "Both datasets should have the same length"
-        
-        indices = np.arange(len(original_data))
-        np.random.shuffle(indices)
-        
-        for i in range(0, len(indices), batch_size):
-            batch_indices = indices[i:i+batch_size]
-            batch_original = [original_data[idx] for idx in batch_indices]
-            batch_detoxified = [detoxified_data[idx] for idx in batch_indices]
-            
-            yield batch_original, batch_detoxified
-    
-    def max_margin_loss(self, original_rewards, detoxified_rewards, margin=None):
-        """
-        Compute max-margin loss.
-        
-        Args:
-            original_rewards: Rewards for original (toxic) samples
-            detoxified_rewards: Rewards for detoxified samples
-            margin: Margin value (if None, use config value)
-            
-        Returns:
-            Loss value
-        """
-        if margin is None:
-            margin = self.config.training.margin
-            
-        # We want detoxified_rewards > original_rewards + margin
-        reward_diff = detoxified_rewards - original_rewards
-        loss = torch.clamp(margin - reward_diff, min=0)
-        
-        # Check for NaN and replace with zeros
-        loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-        
-        return loss.mean()
-    
-    def train(self, train_data, test_data):
-        """
-        Train the reward model.
-        
-        Args:
-            train_data: Training data
-            test_data: Test data
-            
-        Returns:
-            Trained model and metrics history
-        """
-        # Initialize optimizer
-        optimizer = AdamW(
-            filter(lambda p: p.requires_grad, self.reward_model.parameters()),
-            lr=self.config.training.learning_rate,
-            weight_decay=self.config.training.weight_decay,
-            eps=self.config.training.adam_epsilon
-        )
-        
-        # Training loop
-        print("Starting training...")
-        self.metrics_history = []
-        
-        # Log config to wandb
-        if self.config.logging.use_wandb and wandb.run is not None:
-            wandb.config.update(self.config.to_dict())
-        
-        for epoch in range(self.config.training.epochs):
-            self.reward_model.train()
-            epoch_losses = []
-            
-            # Progress bar for batches
-            progress_bar = tqdm(
-                self.data_loader(
-                    train_data['original'], 
-                    train_data['detoxified'], 
-                    self.config.training.batch_size
-                ),
-                desc=f"Epoch {epoch+1}/{self.config.training.epochs}"
-            )
-            
-            # Process batches
-            for batch_original, batch_detoxified in progress_bar:
-                optimizer.zero_grad()
-                
-                # Get original outputs
-                original_texts = [item['output'] for item in batch_original]
-                original_inputs = self.tokenizer(
-                    original_texts,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=self.config.training.max_length
-                )
-                # Move everything to the correct device
-                original_inputs = {k: v.to(self.device) for k, v in original_inputs.items()}
-                
-                original_rewards = self.reward_model(**original_inputs)
-                
-                # Get detoxified outputs
-                detoxified_texts = [item['output'] for item in batch_detoxified]
-                detoxified_inputs = self.tokenizer(
-                    detoxified_texts,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=self.config.training.max_length
-                )
-                # Move everything to the correct device
-                detoxified_inputs = {k: v.to(self.device) for k, v in detoxified_inputs.items()}
-                
-                detoxified_rewards = self.reward_model(**detoxified_inputs)
-                
-                # Compute loss
-                loss = self.max_margin_loss(original_rewards, detoxified_rewards)
-                
-                # Check for NaN before backward
-                if torch.isnan(loss).any() or torch.isinf(loss).any():
-                    print(f"Warning: NaN or Inf detected in loss. Skipping batch.")
-                    continue
-                
-                # Backward pass
-                loss.backward()
-                
-                # Add gradient clipping
-                torch.nn.utils.clip_grad_norm_(
-                    self.reward_model.parameters(), 
-                    max_norm=self.config.training.grad_clip
-                )
-                
-                optimizer.step()
-                
-                epoch_losses.append(loss.item())
-                
-                # Update progress bar
-                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
-                
-                # Free up memory
-                del original_inputs, detoxified_inputs
-                torch.cuda.empty_cache()
-            
-            # Calculate average loss for epoch
-            avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else float('nan')
-            print(f"Epoch {epoch+1}/{self.config.training.epochs}, Loss: {avg_loss:.4f}")
-            
-            # Log loss to wandb
-            if self.config.logging.use_wandb and wandb.run is not None:
-                wandb.log({"train_loss": avg_loss, "epoch": epoch + 1})
-            
-            # Evaluate periodically
-            if (epoch + 1) % self.config.training.eval_interval == 0 or epoch == self.config.training.epochs - 1:
-                print(f"Evaluating at epoch {epoch+1}...")
-                metrics = self.evaluate(test_data)
-                
-                # Add epoch and loss to metrics
-                metrics['epoch'] = epoch + 1
-                metrics['loss'] = avg_loss
-                self.metrics_history.append(metrics)
-                
-                # Print metrics
-                print(f"Metrics at epoch {epoch+1}:")
-                for k, v in metrics.items():
-                    if isinstance(v, (int, float)):
-                        print(f"  {k}: {v:.4f}")
-                
-                # Log metrics to wandb
-                if self.config.logging.use_wandb and wandb.run is not None:
-                    wandb.log(metrics)
-                
-                # Save checkpoint if configured
-                if self.config.logging.save_model:
-                    self.save_checkpoint(epoch + 1)
-        
-        # Save the final model
-        if self.config.logging.save_model:
-            self.save_model()
-        
-        return self.reward_model, self.metrics_history
-    
-    def evaluate(self, test_data):
-        """
-        Evaluate the reward model.
-        
-        Args:
-            test_data: Test data
-            
-        Returns:
-            Evaluation metrics
-        """
-        self.reward_model.eval()
-        self.true_reward_model.eval()
-        
-        original_outputs = []
-        detoxified_outputs = []
-        ground_truth_labels = []  # 1 for original (toxic), 0 for detoxified (non-toxic)
-        
-        # Process in batches
-        batch_size = self.config.training.batch_size
-        
-        with torch.no_grad():
-            # Process original (toxic) examples in batches
-            for i in range(0, len(test_data['original']), batch_size):
-                batch = test_data['original'][i:i+batch_size]
-                texts = [item['output'] for item in batch]
-                
-                # Tokenize
-                inputs = self.tokenizer(
-                    texts,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=self.config.training.max_length
-                )
-                # Move to device
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                
-                # Get learned rewards
-                rewards = self.reward_model(**inputs)
-                
-                # Convert to list of floats
-                rewards_list = rewards.squeeze().cpu().tolist()
-                
-                # Handle single item case
-                if not isinstance(rewards_list, list):
-                    rewards_list = [rewards_list]
-                
-                original_outputs.extend(rewards_list)
-                
-                # Add ground truth labels
-                ground_truth_labels.extend([1] * len(batch))
-            
-            # Process detoxified examples in batches
-            for i in range(0, len(test_data['detoxified']), batch_size):
-                batch = test_data['detoxified'][i:i+batch_size]
-                texts = [item['output'] for item in batch]
-                
-                # Tokenize
-                inputs = self.tokenizer(
-                    texts,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=self.config.training.max_length
-                )
-                # Move to device
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                
-                # Get learned rewards
-                rewards = self.reward_model(**inputs)
-                
-                # Convert to list of floats
-                rewards_list = rewards.squeeze().cpu().tolist()
-                
-                # Handle single item case
-                if not isinstance(rewards_list, list):
-                    rewards_list = [rewards_list]
-                
-                detoxified_outputs.extend(rewards_list)
-                
-                # Add ground truth labels
-                ground_truth_labels.extend([0] * len(batch))
-        
-        # Compute true rewards using the ground truth model
-        true_rewards = []
-        all_texts = [test_data['original'][i]['output'] for i in range(len(test_data['original']))] + \
-                    [test_data['detoxified'][i]['output'] for i in range(len(test_data['detoxified']))]
-        
-        # Process in batches
-        for i in range(0, len(all_texts), batch_size):
-            batch_texts = all_texts[i:i+batch_size]
-            
-            # Tokenize for the true reward model
-            inputs = self.true_reward_tokenizer(
-                batch_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=self.config.training.max_length
-            ).to(self.device)
-            
-            # Get true rewards
-            logits = self.true_reward_model(**inputs).logits
-            
-            # Use the first logit (non-toxic) as the reward
-            batch_rewards = logits[:, 0].cpu().tolist()
-            true_rewards.extend(batch_rewards)
-        
-        # Get all outputs together
-        all_outputs = original_outputs + detoxified_outputs
-        
-        # Compute metrics
-        metrics = {}
-        
-        # Convert learned rewards to binary predictions
-        # Higher reward should indicate less toxic (more detoxified)
-        threshold = np.mean(all_outputs)  # Simple threshold
-        learned_predictions = (np.array(all_outputs) > threshold).astype(int)
-        learned_predictions = 1 - learned_predictions  # Invert to match ground truth (1=toxic)
-        
-        # Accuracy
-        metrics['accuracy'] = accuracy_score(ground_truth_labels, learned_predictions)
-        
-        # F1 Score
-        metrics['f1'] = f1_score(ground_truth_labels, learned_predictions)
-        
-        # AUC-ROC
-        metrics['auc_roc'] = roc_auc_score(ground_truth_labels, [-x for x in all_outputs])  # Invert for ROC
-        
-        # Correlation with true rewards
-        metrics['pearson_correlation'] = np.corrcoef([-x for x in all_outputs], true_rewards)[0, 1]
-        metrics['spearman_correlation'] = stats.spearmanr([-x for x in all_outputs], true_rewards).correlation
-        metrics['kendall_tau'] = stats.kendalltau([-x for x in all_outputs], true_rewards).correlation
-        
-        # Average predicted rewards
-        metrics['avg_original_reward'] = np.mean(original_outputs)
-        metrics['avg_detoxified_reward'] = np.mean(detoxified_outputs)
-        metrics['reward_diff'] = metrics['avg_detoxified_reward'] - metrics['avg_original_reward']
-        
-        # Return metrics
-        return metrics
-    
-    def save_checkpoint(self, epoch):
-        """
-        Save a model checkpoint.
-        
-        Args:
-            epoch: Current epoch number
-        """
-        # Create checkpoint directory
-        checkpoint_dir = os.path.join(self.model_save_dir, f"checkpoint-{epoch}")
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        
-        # Save model
-        model_path = os.path.join(checkpoint_dir, "model.pt")
-        self.reward_model.save(model_path)
-        
-        # Save tokenizer
-        self.tokenizer.save_pretrained(checkpoint_dir)
-        
-        # Save metrics
-        metrics_path = os.path.join(checkpoint_dir, "metrics.json")
-        with open(metrics_path, "w") as f:
-            json.dump(
-                {k: float(v) if isinstance(v, (np.float32, np.float64)) else v
-                 for k, v in self.metrics_history[-1].items()},
-                f, indent=2
-            )
-        
-        # Log to wandb if configured
-        if self.config.logging.use_wandb and wandb.run is not None:
-            # This will upload the files to wandb
-            checkpoint_artifact = wandb.Artifact(
-                f"model-checkpoint-{epoch}", 
-                type="model",
-                metadata=self.metrics_history[-1]
-            )
-            checkpoint_artifact.add_dir(checkpoint_dir)
-            wandb.log_artifact(checkpoint_artifact)
-        
-        # Save to Google Drive if configured
-        if self.config.logging.save_to_drive and os.path.exists('/content/drive'):
+        # Then unfreeze the last n layers
+        if num_unfrozen_layers > 0:
             try:
-                drive_checkpoint_dir = os.path.join(
-                    self.config.logging.drive_path, 
-                    "models",
-                    self.model_identifier,
-                    f"checkpoint-{epoch}"
-                )
-                os.makedirs(drive_checkpoint_dir, exist_ok=True)
-                
-                # Copy model
-                drive_model_path = os.path.join(drive_checkpoint_dir, "model.pt")
-                self.reward_model.save(drive_model_path)
-                
-                # Copy tokenizer
-                self.tokenizer.save_pretrained(drive_checkpoint_dir)
-                
-                # Copy metrics
-                drive_metrics_path = os.path.join(drive_checkpoint_dir, "metrics.json")
-                with open(drive_metrics_path, "w") as f:
-                    json.dump(
-                        {k: float(v) if isinstance(v, (np.float32, np.float64)) else v
-                         for k, v in self.metrics_history[-1].items()},
-                        f, indent=2
-                    )
+                # For different model architectures, we need to handle this differently
+                if hasattr(self.model, 'transformer'):
+                    # For GPT-Neo and similar models
+                    layers = self.model.transformer.h
+                    for i in range(1, num_unfrozen_layers + 1):
+                        layer_idx = len(layers) - i
+                        for param in layers[layer_idx].parameters():
+                            param.requires_grad = True
+                        print(f"Unfrozen layer {layer_idx} of {len(layers) - 1}")
+                elif hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+                    # For some newer models
+                    layers = self.model.model.layers
+                    for i in range(1, num_unfrozen_layers + 1):
+                        layer_idx = len(layers) - i
+                        for param in layers[layer_idx].parameters():
+                            param.requires_grad = True
+                        print(f"Unfrozen layer {layer_idx} of {len(layers) - 1}")
+                else:
+                    print("Unsupported model architecture. Could not unfreeze specific layers.")
+                    # Unfreeze all parameters as a fallback
+                    for param in self.model.parameters():
+                        param.requires_grad = True
             except Exception as e:
-                print(f"Could not save checkpoint to Google Drive: {e}")
+                print(f"Error unfreezing layers: {e}")
+                # Unfreeze value head as a minimum
+                for param in self.v_head.parameters():
+                    param.requires_grad = True
     
-    def save_model(self):
-        """Save the final model."""
-        # Create model directory
-        model_path = os.path.join(self.model_save_dir, "model.pt")
+    def forward(self, input_ids, attention_mask=None):
+        """
+        Forward pass through the model.
         
-        # Save model
-        self.reward_model.save(model_path)
+        Args:
+            input_ids: Input token IDs
+            attention_mask: Attention mask for padding
+            
+        Returns:
+            Toxicity score values (lower = more toxic)
+        """
+        # Make sure inputs are on the correct device
+        input_ids = input_ids.to(self.device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
         
-        # Save tokenizer
-        self.tokenizer.save_pretrained(self.model_save_dir)
-        
-        # Save all metrics
-        metrics_path = os.path.join(self.model_save_dir, "metrics.json")
-        with open(metrics_path, "w") as f:
-            json.dump(
-                [{k: float(v) if isinstance(v, (np.float32, np.float64)) else v
-                  for k, v in m.items()} for m in self.metrics_history],
-                f, indent=2
-            )
-        
-        # Save config
-        config_path = os.path.join(self.model_save_dir, "config.yaml")
-        self.config.save(config_path)
-        
-        # Log to wandb if configured
-        if self.config.logging.use_wandb and wandb.run is not None:
-            # This will upload the files to wandb
-            model_artifact = wandb.Artifact(
-                f"model-final", 
-                type="model",
-                metadata=self.metrics_history[-1] if self.metrics_history else {}
-            )
-            model_artifact.add_dir(self.model_save_dir)
-            wandb.log_artifact(model_artifact)
-        
-        # Save to Google Drive if configured
-        if self.config.logging.save_to_drive and os.path.exists('/content/drive'):
-            try:
-                drive_model_dir = os.path.join(
-                    self.config.logging.drive_path, 
-                    "models",
-                    self.model_identifier
-                )
-                os.makedirs(drive_model_dir, exist_ok=True)
+        # Use autocast for mixed precision if needed - use string device type
+        with torch.amp.autocast(device_type=self.device_type, enabled=self.use_half_precision):
+            # Get the hidden states from the base model
+            outputs = self.model(input_ids, attention_mask=attention_mask, output_hidden_states=True)
+            hidden_states = outputs.hidden_states[-1]  # Use the last hidden state
+            
+            # Use mean pooling for more stable representations
+            if attention_mask is not None:
+                # Expand attention mask to match hidden state dimensions
+                expanded_mask = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
+                # Apply mask and get sum
+                masked_hidden = hidden_states * expanded_mask
+                sum_hidden = torch.sum(masked_hidden, dim=1)
+                # Get token count (avoid division by zero)
+                token_count = torch.clamp(attention_mask.sum(dim=1, keepdim=True), min=1.0)
+                # Mean pooling
+                pooled_hidden = sum_hidden / token_count
+                # Apply value head and clamp values for stability
+                values = self.v_head(pooled_hidden)
+                values = torch.clamp(values, min=-10.0, max=10.0)
+            else:
+                # Fallback to last token if no mask
+                last_token_indices = torch.tensor([input_ids.size(1)-1] * input_ids.size(0), device=input_ids.device)
+                batch_indices = torch.arange(hidden_states.size(0), device=hidden_states.device)
+                last_hidden_states = hidden_states[batch_indices, last_token_indices]
+                values = self.v_head(last_hidden_states)
+                values = torch.clamp(values, min=-10.0, max=10.0)
                 
-                # Copy model
-                drive_model_path = os.path.join(drive_model_dir, "model.pt")
-                self.reward_model.save(drive_model_path)
-                
-                # Copy tokenizer
-                self.tokenizer.save_pretrained(drive_model_dir)
-                
-                # Copy metrics
-                drive_metrics_path = os.path.join(drive_model_dir, "metrics.json")
-                with open(drive_metrics_path, "w") as f:
-                    json.dump(
-                        [{k: float(v) if isinstance(v, (np.float32, np.float64)) else v
-                          for k, v in m.items()} for m in self.metrics_history],
-                        f, indent=2
-                    )
-                
-                # Copy config
-                drive_config_path = os.path.join(drive_model_dir, "config.yaml")
-                self.config.save(drive_config_path)
-                
-                print(f"Model and metrics also saved to Google Drive at {drive_model_dir}")
-            except Exception as e:
-                print(f"Could not save model to Google Drive: {e}")
+            return values
+    
+    def save(self, path):
+        """Save the model to disk."""
+        # Save v_head and config
+        state_dict = {
+            'v_head': self.v_head.state_dict(),
+            'config': {
+                'model_name': self.model.config._name_or_path,
+                'use_half_precision': self.use_half_precision
+            }
+        }
+        torch.save(state_dict, path)
+    
+    @classmethod
+    def load(cls, path, device="cuda"):
+        """Load the model from disk."""
+        state_dict = torch.load(path, map_location=device)
+        config = state_dict['config']
         
-        print(f"Training complete. Model saved to {self.model_save_dir}")
+        # Create a new model
+        model = cls(config['model_name'], 
+                   use_half_precision=config['use_half_precision'],
+                   device=device, 
+                   num_unfrozen_layers=0)  # Load with all frozen since we're just inferencing
+        
+        # Load v_head
+        model.v_head.load_state_dict(state_dict['v_head'])
+        
+        return model
