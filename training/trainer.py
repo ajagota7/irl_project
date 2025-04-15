@@ -215,7 +215,9 @@ class RewardModelTrainer:
                     padding=True,
                     truncation=True,
                     max_length=self.config.training.max_length
-                ).to(self.device)
+                )
+                # Move everything to the correct device
+                original_inputs = {k: v.to(self.device) for k, v in original_inputs.items()}
                 
                 original_rewards = self.reward_model(**original_inputs)
                 
@@ -227,7 +229,9 @@ class RewardModelTrainer:
                     padding=True,
                     truncation=True,
                     max_length=self.config.training.max_length
-                ).to(self.device)
+                )
+                # Move everything to the correct device
+                detoxified_inputs = {k: v.to(self.device) for k, v in detoxified_inputs.items()}
                 
                 detoxified_rewards = self.reward_model(**detoxified_inputs)
                 
@@ -260,7 +264,7 @@ class RewardModelTrainer:
                 torch.cuda.empty_cache()
             
             # Calculate average loss for epoch
-            avg_loss = sum(epoch_losses) / len(epoch_losses)
+            avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else float('nan')
             print(f"Epoch {epoch+1}/{self.config.training.epochs}, Loss: {avg_loss:.4f}")
             
             # Log loss to wandb
@@ -330,7 +334,9 @@ class RewardModelTrainer:
                     padding=True,
                     truncation=True,
                     max_length=self.config.training.max_length
-                ).to(self.device)
+                )
+                # Move to device
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
                 
                 # Get learned rewards
                 rewards = self.reward_model(**inputs)
@@ -359,7 +365,9 @@ class RewardModelTrainer:
                     padding=True,
                     truncation=True,
                     max_length=self.config.training.max_length
-                ).to(self.device)
+                )
+                # Move to device
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
                 
                 # Get learned rewards
                 rewards = self.reward_model(**inputs)
