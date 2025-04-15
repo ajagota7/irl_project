@@ -20,7 +20,7 @@ irl_project/
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/irl-detoxification.git
+git clone https://github.com/ajagota7/irl-detoxification.git
 cd irl-detoxification
 
 # Install dependencies
