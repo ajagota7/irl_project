@@ -41,20 +41,22 @@ class CheckpointDatasetGenerator:
             Loaded model and tokenizer
         """
         repo_id = f"{username}/{model_name}"
-        checkpoint_path = f"{checkpoint_folder}"
+        checkpoint_path = f"{repo_id}/{checkpoint_folder}"
         
-        print(f"Loading model from {repo_id}/{checkpoint_path}")
+        print(f"Loading model from {checkpoint_path}")
         
         try:
             # Load tokenizer from the checkpoint
             tokenizer = AutoTokenizer.from_pretrained(
-                f"{repo_id}/{checkpoint_path}",
+                repo_id,
+                subfolder=checkpoint_folder,
                 use_fast=True
             )
             
             # Load model from the checkpoint
             model = AutoModelForCausalLM.from_pretrained(
-                f"{repo_id}/{checkpoint_path}",
+                repo_id,
+                subfolder=checkpoint_folder,
                 torch_dtype=torch.float16 if self.config.model.use_half_precision else None,
                 device_map="auto"
             )
