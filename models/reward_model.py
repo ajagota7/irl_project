@@ -58,21 +58,32 @@ class RewardModel(nn.Module):
                     layers = self.model.transformer.h
                     for i in range(1, num_unfrozen_layers + 1):
                         layer_idx = len(layers) - i
-                        for param in layers[layer_idx].parameters():
-                            param.requires_grad = True
-                        print(f"Unfrozen layer {layer_idx} of {len(layers) - 1}")
+                        if layer_idx >= 0:  # Ensure we don't go out of bounds
+                            for param in layers[layer_idx].parameters():
+                                param.requires_grad = True
+                            print(f"Unfrozen layer {layer_idx} of {len(layers) - 1}")
                 elif hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
                     # For some newer models
                     layers = self.model.model.layers
                     for i in range(1, num_unfrozen_layers + 1):
                         layer_idx = len(layers) - i
-                        for param in layers[layer_idx].parameters():
-                            param.requires_grad = True
-                        print(f"Unfrozen layer {layer_idx} of {len(layers) - 1}")
+                        if layer_idx >= 0:  # Ensure we don't go out of bounds
+                            for param in layers[layer_idx].parameters():
+                                param.requires_grad = True
+                            print(f"Unfrozen layer {layer_idx} of {len(layers) - 1}")
+                elif hasattr(self.model, 'model') and hasattr(self.model.model, 'decoder') and hasattr(self.model.model.decoder, 'layers'):
+                    # For decoder-only models like OPT
+                    layers = self.model.model.decoder.layers
+                    for i in range(1, num_unfrozen_layers + 1):
+                        layer_idx = len(layers) - i
+                        if layer_idx >= 0:  # Ensure we don't go out of bounds
+                            for param in layers[layer_idx].parameters():
+                                param.requires_grad = True
+                            print(f"Unfrozen layer {layer_idx} of {len(layers) - 1}")
                 else:
                     print("Unsupported model architecture. Could not unfreeze specific layers.")
-                    # Unfreeze all parameters as a fallback
-                    for param in self.model.parameters():
+                    # Unfreeze value head as a fallback
+                    for param in self.v_head.parameters():
                         param.requires_grad = True
             except Exception as e:
                 print(f"Error unfreezing layers: {e}")
