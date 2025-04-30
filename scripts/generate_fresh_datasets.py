@@ -52,6 +52,10 @@ def parse_args():
                         help="Directory for caching datasets")
     parser.add_argument("--shared_dataset", action="store_true",
                         help="Use the same prompts for all checkpoints")
+    parser.add_argument("--external_prompts", type=str, default=None,
+                        help="Path to a JSON file with external prompts")
+    parser.add_argument("--external_dataset", type=str, default=None,
+                        help="Name of HuggingFace dataset to use for prompts (e.g., 'allenai/real-toxicity-prompts')")
     
     return parser.parse_args()
 
@@ -144,9 +148,26 @@ def main():
     results = []
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # Create shared dataset generator if needed
-    shared_dataset_generator = None
-    if config.dataset.shared_dataset:
+    # Handle external prompts
+    external_prompts = None
+    if args.external_prompts or args.external_dataset:
+        print("\n=== Loading external prompts ===")
+        shared_dataset_generator = FreshDatasetGenerator(config)
+        shared_dataset_generator.file_base = "external"
+        
+        try:
+            external_prompts = shared_dataset_generator.load_external_prompts(
+                dataset_path=args.external_prompts,
+                dataset_name=args.external_dataset if args.external_dataset else "allenai/real-toxicity-prompts",
+                num_samples=config.dataset.num_samples
+            )
+            print(f"External prompts loaded successfully")
+        except Exception as e:
+            print(f"Error loading external prompts: {e}")
+            external_prompts = None
+
+    # Generate shared dataset if needed and external prompts not available
+    if config.dataset.shared_dataset and not external_prompts:
         print("\n=== Generating shared dataset ===")
         shared_dataset_generator = FreshDatasetGenerator(config)
         shared_dataset_generator.file_base = "shared"
@@ -180,7 +201,20 @@ def main():
         print(f"{'='*80}")
         
         try:
-            if shared_dataset_generator:
+            if external_prompts:
+                # Use external prompts
+                print(f"Using external prompts for {checkpoint_folder}...")
+                dataset_generator = FreshDatasetGenerator(config)
+                dataset_generator.file_base = f"{checkpoint_num}"
+                
+                # Generate datasets for this checkpoint using external prompts
+                base_data, checkpoint_data = dataset_generator.generate_datasets(
+                    config.model.base_model,
+                    config.model.checkpoint_repo,
+                    checkpoint_folder,
+                    prompts=external_prompts
+                )
+            elif shared_dataset_generator:
                 # Use shared dataset generator
                 print(f"Using shared dataset for {checkpoint_folder}...")
                 dataset_generator = FreshDatasetGenerator(config)

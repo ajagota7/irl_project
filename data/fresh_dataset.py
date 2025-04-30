@@ -363,4 +363,74 @@ class FreshDatasetGenerator:
         print(f"  Checkpoint: avg length = {analysis['checkpoint_length_avg']:.1f}, empty = {checkpoint_empty_pct:.1f}%")
         print(f"  Identical outputs: {identical_pct:.1f}%")
         
-        return analysis 
+        return analysis
+    
+    def load_external_prompts(self, dataset_path=None, dataset_name="allenai/real-toxicity-prompts", num_samples=None):
+        """
+        Load prompts from an external dataset like RealToxicityPrompts.
+        
+        Args:
+            dataset_path: Path to a local JSON file with prompts
+            dataset_name: Name of the HuggingFace dataset to load
+            num_samples: Number of samples to load (None for all)
+            
+        Returns:
+            List of prompts
+        """
+        if dataset_path and os.path.exists(dataset_path):
+            # Load from local file
+            print(f"Loading prompts from {dataset_path}")
+            with open(dataset_path, 'r') as f:
+                data = json.load(f)
+            
+            # Extract prompts based on the file format
+            if isinstance(data, list):
+                if all(isinstance(item, str) for item in data):
+                    prompts = data
+                elif all(isinstance(item, dict) and "prompt" in item for item in data):
+                    prompts = [item["prompt"] for item in data]
+                else:
+                    raise ValueError("Unsupported JSON format for prompts")
+            elif isinstance(data, dict) and "prompts" in data:
+                prompts = data["prompts"]
+            else:
+                raise ValueError("Unsupported JSON format for prompts")
+        else:
+            # Load from HuggingFace dataset
+            try:
+                from datasets import load_dataset
+                print(f"Loading prompts from {dataset_name}")
+                
+                if dataset_name == "allenai/real-toxicity-prompts":
+                    dataset = load_dataset(dataset_name)
+                    # Extract prompts from the RealToxicityPrompts format
+                    prompts = [item["text"] for item in dataset["train"]["prompt"]]
+                else:
+                    # Generic handling for other datasets
+                    dataset = load_dataset(dataset_name)
+                    # Try to find a text field
+                    text_fields = [field for field in dataset["train"].features.keys() 
+                                  if field in ["text", "prompt", "input", "question"]]
+                    
+                    if text_fields:
+                        prompts = dataset["train"][text_fields[0]]
+                    else:
+                        raise ValueError(f"Could not identify prompt field in dataset {dataset_name}")
+            except Exception as e:
+                print(f"Error loading dataset: {e}")
+                prompts = []
+        
+        # Limit number of samples if specified
+        if num_samples and len(prompts) > num_samples:
+            # Use a fixed seed for reproducibility
+            np.random.seed(self.config.seed)
+            prompts = np.random.choice(prompts, num_samples, replace=False).tolist()
+        
+        print(f"Loaded {len(prompts)} prompts")
+        
+        # Save prompts to cache
+        prompts_file = os.path.join(self.config.dataset.cache_dir, f"external_prompts.json")
+        with open(prompts_file, 'w') as f:
+            json.dump(prompts, f)
+        
+        return prompts 
