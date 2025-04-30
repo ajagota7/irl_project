@@ -1,16 +1,22 @@
 # scripts/evaluate_huggingface_checkpoints.py
-import argparse
+import sys
 import os
+# Add the project root directory to the Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import argparse
 import torch
 import wandb
 import json
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 from datetime import datetime
 from tqdm import tqdm
 from huggingface_hub import list_repo_files, hf_hub_download
 
 from config.config import Config, get_config_from_args
-from data.dataset import DatasetGenerator
+from data.checkpoint_dataset import CheckpointDatasetGenerator
 from training.trainer import RewardModelTrainer
 from training.evaluation import plot_metrics, analyze_score_distribution, analyze_errors
 from utils.logging import setup_wandb
@@ -49,11 +55,15 @@ def parse_args():
                         help="Maximum number of new tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.7,
                         help="Temperature for generation")
+    parser.add_argument("--top_p", type=float, default=0.9,
+                        help="Top-p for generation")
+    parser.add_argument("--batch_size", type=int, default=16,
+                        help="Batch size for generation")
     
     # Training arguments
     parser.add_argument("--epochs", type=int, default=20, 
                         help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=4, 
+    parser.add_argument("--train_batch_size", type=int, default=4, 
                         help="Batch size for training")
     parser.add_argument("--learning_rate", type=float, default=1e-5, 
                         help="Learning rate")
@@ -71,6 +81,10 @@ def parse_args():
                         help="Use wandb for logging")
     parser.add_argument("--save_to_drive", action="store_true", 
                         help="Save results to Google Drive (for Colab)")
+    
+    # Pipeline control
+    parser.add_argument("--skip_dataset_generation", action="store_true",
+                        help="Skip dataset generation and use existing datasets")
     
     return parser.parse_args()
 
@@ -117,169 +131,157 @@ def get_checkpoint_folders(username, model_name, checkpoint_pattern="checkpoint-
             # Try to extract a number from the folder name
             return int(folder.replace(checkpoint_pattern, ""))
         except ValueError:
-            return float('inf')  # Put folders without numbers at the end
+            # If we can't extract a number, use a large value to sort to the end
+            return float('inf')
     
     # Sort by checkpoint number
     checkpoint_folders.sort(key=get_checkpoint_number)
     
-    # Filter specific checkpoints if requested
+    # Filter by specific checkpoints if provided
     if specific_checkpoints:
         specific_nums = [int(x.strip()) for x in specific_checkpoints.split(',')]
         checkpoint_folders = [f for f in checkpoint_folders 
                              if get_checkpoint_number(f) in specific_nums]
     else:
-        # Apply step and max_checkpoints
-        checkpoint_folders = checkpoint_folders[::checkpoint_step]
-        if max_checkpoints:
+        # Apply checkpoint step
+        if checkpoint_step > 1:
+            checkpoint_folders = checkpoint_folders[::checkpoint_step]
+        
+        # Apply max checkpoints
+        if max_checkpoints is not None and max_checkpoints > 0:
             checkpoint_folders = checkpoint_folders[:max_checkpoints]
     
-    print(f"Found {len(checkpoint_folders)} checkpoint folders:")
-    for folder in checkpoint_folders:
-        print(f"  - {folder}")
-    
+    print(f"Found {len(checkpoint_folders)} checkpoint folders: {checkpoint_folders}")
     return checkpoint_folders
 
 
-def evaluate_checkpoint(username, model_name, checkpoint_folder, base_model, config):
+def evaluate_checkpoint(checkpoint_folder, username, model_name, base_model, config):
     """
     Evaluate a single checkpoint.
     
     Args:
+        checkpoint_folder: Checkpoint folder name
         username: Hugging Face username
         model_name: Model name
-        checkpoint_folder: Checkpoint folder name
         base_model: Base model name
         config: Configuration object
         
     Returns:
         Dictionary with evaluation results
     """
-    repo_id = f"{username}/{model_name}"
-    checkpoint_path = f"{repo_id}/{checkpoint_folder}"
+    # Extract checkpoint number from folder name
+    try:
+        checkpoint_num = int(checkpoint_folder.replace(config.args.checkpoint_pattern, ""))
+    except ValueError:
+        checkpoint_num = 0
     
-    # Extract checkpoint number for naming
-    checkpoint_num = "unknown"
-    if "-epoch-" in checkpoint_folder:
-        checkpoint_num = checkpoint_folder.split("-epoch-")[1]
-    
-    print(f"\n=== Evaluating checkpoint {checkpoint_folder} (epoch {checkpoint_num}) ===")
-    
-    # Create a unique experiment name
-    experiment_name = f"{model_name}_epoch-{checkpoint_num}_evaluation"
-    
-    # Create a copy of the config for this checkpoint
-    checkpoint_config = Config.from_dict(config.to_dict())
-    checkpoint_config.logging.experiment_name = experiment_name
-    
-    # Initialize wandb for this checkpoint
-    wandb_run = None
-    if checkpoint_config.logging.use_wandb:
-        wandb_run = wandb.init(
-            project=checkpoint_config.logging.project_name,
-            name=experiment_name,
-            config=checkpoint_config.to_dict(),
-            mode=checkpoint_config.logging.wandb_mode,
-            reinit=True
-        )
-        wandb.config.update({
-            "checkpoint_folder": checkpoint_folder,
-            "checkpoint_num": checkpoint_num,
-            "base_model": base_model
-        })
+    print(f"\n{'='*80}")
+    print(f"Evaluating checkpoint: {checkpoint_folder} (Epoch {checkpoint_num})")
+    print(f"{'='*80}")
     
     try:
+        # Create a unique experiment name for this checkpoint
+        experiment_name = f"{model_name}_checkpoint-{checkpoint_num}"
+        
+        # Initialize wandb if configured
+        if config.logging.use_wandb:
+            wandb_run = wandb.init(
+                project=config.logging.project_name,
+                name=experiment_name,
+                config=config.to_dict(),
+                reinit=True
+            )
+        else:
+            wandb_run = None
+        
         # Initialize dataset generator
-        dataset_generator = DatasetGenerator(checkpoint_config)
+        dataset_generator = CheckpointDatasetGenerator(config)
         
         # Set file base for this checkpoint
-        dataset_generator.file_base = f"{model_name}_epoch-{checkpoint_num}"
+        dataset_generator.file_base = f"{model_name}_checkpoint-{checkpoint_num}"
         
-        # Override model paths to use the checkpoint and base model
-        dataset_generator.original_model_path = checkpoint_path
-        dataset_generator.detoxified_model_path = base_model
-        
-        # Generate datasets
-        print(f"Generating datasets from {checkpoint_path}...")
-        original_data, detoxified_data = dataset_generator.generate_datasets()
-        
-        # Analyze datasets
-        print("Analyzing datasets...")
-        analysis = dataset_generator.analyze_datasets()
-        
-        # Log dataset analysis to wandb
-        if wandb_run is not None:
-            wandb.log({
-                "dataset_generation_complete": True,
-                "dataset_analysis": analysis
-            })
+        # Generate or load datasets
+        if not config.args.skip_dataset_generation:
+            print(f"Generating datasets for {checkpoint_folder}...")
+            original_data, detoxified_data = dataset_generator.generate_datasets(
+                username, model_name, checkpoint_folder, base_model
+            )
+            
+            # Analyze datasets
+            print("Analyzing datasets...")
+            dataset_analysis = dataset_generator.analyze_datasets()
+        else:
+            print(f"Loading existing datasets for {checkpoint_folder}...")
+            try:
+                original_data, detoxified_data = dataset_generator.load_datasets()
+                dataset_analysis = dataset_generator.analyze_datasets()
+            except FileNotFoundError as e:
+                return {
+                    "checkpoint_folder": checkpoint_folder,
+                    "checkpoint_num": checkpoint_num,
+                    "error": f"Dataset files not found. Please generate datasets first or disable --skip_dataset_generation. Error: {str(e)}"
+                }
         
         # Initialize trainer
         print("Initializing trainer...")
-        trainer = RewardModelTrainer(checkpoint_config)
+        trainer = RewardModelTrainer(config)
         
         # Prepare data
         train_data, test_data = trainer.prepare_data(original_data, detoxified_data)
         
         # Train model
-        print(f"Training reward model...")
+        print(f"Training reward model for {checkpoint_folder}...")
         reward_model, metrics_history = trainer.train(train_data, test_data)
         
-        # Plot metrics
-        print("Generating training metrics plots...")
-        metadata = plot_metrics(metrics_history, checkpoint_config, file_base=dataset_generator.file_base)
+        # Get final metrics
+        final_metrics = metrics_history[-1] if metrics_history else {}
         
-        # Analyze score distribution
-        print("Analyzing score distribution...")
-        original_scores, detoxified_scores = analyze_score_distribution(
-            reward_model, trainer.tokenizer, test_data, checkpoint_config
-        )
+        # Calculate score difference
+        score_difference = final_metrics.get("reward_diff", 0)
         
         # Analyze errors
         print("Analyzing errors...")
         misclassified_original, misclassified_detoxified = analyze_errors(
-            reward_model, trainer.tokenizer, test_data, checkpoint_config
+            reward_model, test_data, config
         )
         
-        # Compile results
-        results = {
-            "checkpoint_folder": checkpoint_folder,
-            "checkpoint_num": checkpoint_num,
-            "metrics_history": metrics_history,
-            "final_metrics": metrics_history[-1] if metrics_history else {},
-            "original_scores_mean": float(np.mean(original_scores)),
-            "detoxified_scores_mean": float(np.mean(detoxified_scores)),
-            "score_difference": float(np.mean(detoxified_scores) - np.mean(original_scores)),
-            "misclassification_rate_original": len(misclassified_original) / len(test_data['original']),
-            "misclassification_rate_detoxified": len(misclassified_detoxified) / len(test_data['detoxified']),
-            "dataset_analysis": analysis
-        }
+        # Calculate misclassification rates
+        misclassification_rate_original = len(misclassified_original) / len(test_data["original"])
+        misclassification_rate_detoxified = len(misclassified_detoxified) / len(test_data["detoxified"])
         
-        # Log final results to wandb
+        # Log to wandb if configured
         if wandb_run is not None:
             wandb.log({
-                "evaluation_complete": True,
-                "final_metrics": results["final_metrics"],
-                "score_difference": results["score_difference"],
-                "misclassification_rate_original": results["misclassification_rate_original"],
-                "misclassification_rate_detoxified": results["misclassification_rate_detoxified"],
+                "final_metrics": final_metrics,
+                "score_difference": score_difference,
+                "misclassification_rate_original": misclassification_rate_original,
+                "misclassification_rate_detoxified": misclassification_rate_detoxified,
+                "dataset_analysis": dataset_analysis
             })
             
             # Finish wandb run
             wandb.finish()
         
-        return results
-    
+        # Return results
+        return {
+            "checkpoint_folder": checkpoint_folder,
+            "checkpoint_num": checkpoint_num,
+            "final_metrics": final_metrics,
+            "score_difference": score_difference,
+            "misclassification_rate_original": misclassification_rate_original,
+            "misclassification_rate_detoxified": misclassification_rate_detoxified,
+            "dataset_analysis": dataset_analysis
+        }
+        
     except Exception as e:
         print(f"Error evaluating checkpoint {checkpoint_folder}: {e}")
         import traceback
         traceback.print_exc()
         
-        # Log error to wandb
-        if wandb_run is not None:
-            wandb.log({"evaluation_error": str(e)})
+        # Finish wandb run if it exists
+        if 'wandb_run' in locals() and wandb_run is not None:
             wandb.finish()
         
-        # Return error
         return {
             "checkpoint_folder": checkpoint_folder,
             "checkpoint_num": checkpoint_num,
@@ -288,7 +290,7 @@ def evaluate_checkpoint(username, model_name, checkpoint_folder, base_model, con
 
 
 def evaluate_checkpoints():
-    """Evaluate multiple checkpoint models."""
+    """Evaluate multiple checkpoints."""
     # Parse arguments
     args = parse_args()
     
@@ -296,37 +298,45 @@ def evaluate_checkpoints():
     if args.config:
         config = Config.from_yaml(args.config)
     else:
-        config = get_config_from_args(args)
+        config = Config()
+    
+    # Store args in config for later use
+    config.args = args
     
     # Update config with command line arguments
-    if args.output_dir:
-        config.logging.eval_dir = args.output_dir
     if args.dataset_dir:
         config.dataset.cache_dir = args.dataset_dir
+    if args.output_dir:
+        config.logging.eval_dir = args.output_dir
+        config.logging.log_dir = os.path.join(args.output_dir, "logs")
+        config.logging.model_dir = os.path.join(args.output_dir, "models")
     if args.num_samples:
         config.dataset.num_samples = args.num_samples
     if args.max_new_tokens:
         config.dataset.max_new_tokens = args.max_new_tokens
     if args.temperature:
         config.dataset.temperature = args.temperature
-    if args.epochs:
-        config.training.epochs = args.epochs
+    if args.top_p:
+        config.dataset.top_p = args.top_p
     if args.batch_size:
-        config.training.batch_size = args.batch_size
+        config.dataset.batch_size = args.batch_size
+    if args.train_batch_size:
+        config.training.batch_size = args.train_batch_size
     if args.learning_rate:
         config.training.learning_rate = args.learning_rate
+    if args.epochs:
+        config.training.epochs = args.epochs
     if args.project_name:
         config.logging.project_name = args.project_name
     if args.experiment_name:
         config.logging.experiment_name = args.experiment_name
     if args.use_wandb:
-        config.logging.use_wandb = True
+        config.logging.use_wandb = args.use_wandb
     if args.save_to_drive:
-        config.logging.save_to_drive = True
+        config.logging.save_to_drive = args.save_to_drive
     
     # Set random seeds
     torch.manual_seed(config.training.seed)
-    import numpy as np
     np.random.seed(config.training.seed)
     
     # Set up directories
@@ -350,28 +360,28 @@ def evaluate_checkpoints():
     results = []
     for checkpoint_folder in tqdm(checkpoint_folders, desc="Evaluating checkpoints"):
         result = evaluate_checkpoint(
-            args.username, 
-            args.model_name, 
-            checkpoint_folder, 
+            checkpoint_folder,
+            args.username,
+            args.model_name,
             args.base_model,
             config
         )
         results.append(result)
+        print(f"Completed evaluation of {checkpoint_folder}")
     
-    # Save overall results
+    # Save results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_file = os.path.join(config.logging.eval_dir, f"{args.model_name}_evaluation_results_{timestamp}.json")
+    results_file = os.path.join(config.logging.eval_dir, f"{args.model_name}_evaluation_{timestamp}.json")
     
     # Convert numpy values to Python types for JSON serialization
     def convert_for_json(obj):
-        if isinstance(obj, np.integer):
+        if isinstance(obj, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32, np.uint64)):
             return int(obj)
-        elif isinstance(obj, np.floating):
+        elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
             return float(obj)
-        elif isinstance(obj, np.ndarray):
+        elif isinstance(obj, (np.ndarray,)):
             return obj.tolist()
-        else:
-            return obj
+        return obj
     
     # Extract summary metrics
     summary_results = []
@@ -400,9 +410,6 @@ def evaluate_checkpoints():
     
     # Plot comparison of checkpoints
     try:
-        import matplotlib.pyplot as plt
-        import pandas as pd
-        
         # Extract data for plotting
         checkpoint_nums = []
         accuracies = []
